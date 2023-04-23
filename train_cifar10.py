@@ -4,8 +4,6 @@ import wandb
 from ddpm_conditional import Diffusion
 from utils import get_cifar
 
-# test
-# test 111
 
 # Trains a conditional diffusion model on CIFAR10
 # This is a very simple example, for more advanced training, see `ddp_conditional.py`
