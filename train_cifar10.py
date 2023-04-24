@@ -8,7 +8,7 @@ from utils import get_cifar
 # Trains a conditional diffusion model on CIFAR10
 # This is a very simple example, for more advanced training, see `ddp_conditional.py`
 
-config = SimpleNamespace(    
+config = SimpleNamespace(
     run_name = "cifar10_ddpm_conditional",
     epochs = 25,
     noise_steps=1000,
@@ -30,5 +30,5 @@ config = SimpleNamespace(
 diff = Diffusion(noise_steps=config.noise_steps , img_size=config.img_size)
 
 with wandb.init(project="train_sd", group="train", config=config):
-    diff.prepare(config)
+    diff.prepare(config) 
     diff.fit(config)

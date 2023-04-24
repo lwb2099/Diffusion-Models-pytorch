@@ -8,7 +8,7 @@ def one_param(m):
     return next(iter(m.parameters()))
 
 class EMA:
-    def __init__(self, beta):
+    def __init__(self, beta=0.99):
         super().__init__()
         self.beta = beta
         self.step = 0
@@ -19,6 +19,7 @@ class EMA:
             ma_params.data = self.update_average(old_weight, up_weight)
 
     def update_average(self, old, new):
+        # * w = beata*w_old + (1-beata)*w_new
         if old is None:
             return new
         return old * self.beta + (1 - self.beta) * new
@@ -49,11 +50,15 @@ class SelfAttention(nn.Module):
         )
 
     def forward(self, x):
-        size = x.shape[-1]
+        size = x.shape[-1]  # H & W
+        # [B,C,H,W] -> [B,H*W,C] e.g. [5,128,16,16] -> [5,1024,128]
         x = x.view(-1, self.channels, size * size).swapaxes(1, 2)
         x_ln = self.ln(x)
+        # [batch,1024,]
         attention_value, _ = self.mha(x_ln, x_ln, x_ln)
+        # * add & layernorm
         attention_value = attention_value + x
+        # * feedforward with residual connection
         attention_value = self.ff_self(attention_value) + attention_value
         return attention_value.swapaxes(2, 1).view(-1, self.channels, size, size)
 
@@ -134,6 +139,7 @@ class UNet(nn.Module):
         self.time_dim = time_dim
         self.remove_deep_conv = remove_deep_conv
         self.inc = DoubleConv(c_in, 64)
+        # * down
         self.down1 = Down(64, 128)
         self.sa1 = SelfAttention(128)
         self.down2 = Down(128, 256)
@@ -141,7 +147,8 @@ class UNet(nn.Module):
         self.down3 = Down(256, 256)
         self.sa3 = SelfAttention(256)
 
-
+        # ? dont know why should have this option: remove_deep_conv...
+        # * bottle-neck
         if remove_deep_conv:
             self.bot1 = DoubleConv(256, 256)
             self.bot3 = DoubleConv(256, 256)
@@ -149,7 +156,7 @@ class UNet(nn.Module):
             self.bot1 = DoubleConv(256, 512)
             self.bot2 = DoubleConv(512, 512)
             self.bot3 = DoubleConv(512, 256)
-
+        # * up
         self.up1 = Up(512, 128)
         self.sa4 = SelfAttention(128)
         self.up2 = Up(256, 64)
@@ -168,26 +175,35 @@ class UNet(nn.Module):
         pos_enc = torch.cat([pos_enc_a, pos_enc_b], dim=-1)
         return pos_enc
 
-    def unet_forwad(self, x, t):
+    def unet_forwad(self, x, t): 
+        #* x: [batch,3,64,64]; t:[batch,256]
+        #* we use different x_* because up sample requires forward x_*
+        # x1:[5,64,64,64]
         x1 = self.inc(x)
+        # x2:[5,128,32,32]
         x2 = self.down1(x1, t)
         x2 = self.sa1(x2)
+        # x3:[5,256,16,16]
         x3 = self.down2(x2, t)
         x3 = self.sa2(x3)
+        # x4:[5,512,8,8]
         x4 = self.down3(x3, t)
         x4 = self.sa3(x4)
-
+        # x4:[5,256,8,8]
         x4 = self.bot1(x4)
         if not self.remove_deep_conv:
             x4 = self.bot2(x4)
         x4 = self.bot3(x4)
-
+        # x:[5,128,16,16]
         x = self.up1(x4, x3, t)
-        x = self.sa4(x)
+        x = self.sa4(x)  
+        # x:[5,64,32,32]
         x = self.up2(x, x2, t)
         x = self.sa5(x)
         x = self.up3(x, x1, t)
+        # x:[5,64,64,64]
         x = self.sa6(x)
+        # x:[5,3,64,64]
         output = self.outc(x)
         return output
     
@@ -201,13 +217,16 @@ class UNet_conditional(UNet):
     def __init__(self, c_in=3, c_out=3, time_dim=256, num_classes=None, **kwargs):
         super().__init__(c_in, c_out, time_dim, **kwargs)
         if num_classes is not None:
+            # [10, 256]
             self.label_emb = nn.Embedding(num_classes, time_dim)
 
     def forward(self, x, t, y=None):
+        # [batch] -> [batch,1]
         t = t.unsqueeze(-1)
         t = self.pos_encoding(t, self.time_dim)
 
         if y is not None:
+            # * t now has shape[batch, 256]
             t += self.label_emb(y)
 
         return self.unet_forwad(x, t)

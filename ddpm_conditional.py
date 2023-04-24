@@ -23,9 +23,9 @@ from modules import UNet_conditional, EMA
 config = SimpleNamespace(    
     run_name = "DDPM_conditional",
     epochs = 100,
-    noise_steps=1000,
+    noise_steps=50,
     seed = 42,
-    batch_size = 10,
+    batch_size = 5,
     img_size = 64,
     num_classes = 10,
     dataset_path = get_cifar(img_size=64),
@@ -35,6 +35,7 @@ config = SimpleNamespace(
     slice_size = 1,
     do_validation = True,
     fp16 = True,
+    model_ckpt_path='./models/DDPM_conditional/',
     log_every_epoch = 10,
     num_workers=10,
     lr = 5e-3)
@@ -48,12 +49,16 @@ class Diffusion:
         self.noise_steps = noise_steps
         self.beta_start = beta_start
         self.beta_end = beta_end
-
+        # [0.0001,...,0.02] total noise_steps=50 nums
         self.beta = self.prepare_noise_schedule().to(device)
+        # [0.9999,...0.9800]
         self.alpha = 1. - self.beta
+        # * alpha_hat = PI alpha
+        # [0.9999,...,0.6030]
         self.alpha_hat = torch.cumprod(self.alpha, dim=0)
-
+        
         self.img_size = img_size
+        # * c_in should be the same as c_out
         self.model = UNet_conditional(c_in, c_out, num_classes=num_classes, **kwargs).to(device)
         self.ema_model = copy.deepcopy(self.model).eval().requires_grad_(False)
         self.device = device
@@ -61,9 +66,11 @@ class Diffusion:
         self.num_classes = num_classes
 
     def prepare_noise_schedule(self):
+        """get linear interpolation schedule"""
         return torch.linspace(self.beta_start, self.beta_end, self.noise_steps)
     
     def sample_timesteps(self, n):
+        "get random t step from 1~T"
         return torch.randint(low=1, high=self.noise_steps, size=(n,))
 
     def noise_images(self, x, t):
@@ -71,30 +78,39 @@ class Diffusion:
         sqrt_alpha_hat = torch.sqrt(self.alpha_hat[t])[:, None, None, None]
         sqrt_one_minus_alpha_hat = torch.sqrt(1 - self.alpha_hat[t])[:, None, None, None]
         Ɛ = torch.randn_like(x)
+        # *equation 4 from DDPM
         return sqrt_alpha_hat * x + sqrt_one_minus_alpha_hat * Ɛ, Ɛ
     
     @torch.inference_mode()
     def sample(self, use_ema, labels, cfg_scale=3):
+        "Sample from the model"
         model = self.ema_model if use_ema else self.model
         n = len(labels)
         logging.info(f"Sampling {n} new images....")
         model.eval()
         with torch.inference_mode():
+
             x = torch.randn((n, self.c_in, self.img_size, self.img_size)).to(self.device)
+            # * t goes from T to 1
             for i in progress_bar(reversed(range(1, self.noise_steps)), total=self.noise_steps-1, leave=False):
                 t = (torch.ones(n) * i).long().to(self.device)
                 predicted_noise = model(x, t, labels)
                 if cfg_scale > 0:
                     uncond_predicted_noise = model(x, t, None)
+                    # * linear interpolation: out = start + weight​×(end−start​)
+                    # * => pred_noise = uncond_noise + cfg_scale*(pred_noise-uncond_noise)
                     predicted_noise = torch.lerp(uncond_predicted_noise, predicted_noise, cfg_scale)
                 alpha = self.alpha[t][:, None, None, None]
                 alpha_hat = self.alpha_hat[t][:, None, None, None]
                 beta = self.beta[t][:, None, None, None]
                 if i > 1:
                     noise = torch.randn_like(x)
+                # * last step are not using noise
                 else:
                     noise = torch.zeros_like(x)
+                # * equation 6 and 11 in DDPM
                 x = 1 / torch.sqrt(alpha) * (x - ((1 - alpha) / (torch.sqrt(1 - alpha_hat))) * predicted_noise) + torch.sqrt(beta) * noise
+        # * convert (-1,1) to (0,1)
         x = (x.clamp(-1, 1) + 1) / 2
         x = (x * 255).type(torch.uint8)
         return x
@@ -111,15 +127,22 @@ class Diffusion:
         avg_loss = 0.
         if train: self.model.train()
         else: self.model.eval()
-        pbar = progress_bar(self.train_dataloader, leave=False)
+        pbar = progress_bar(self.train_dataloader, leave=False) if train else progress_bar(self.val_dataloader, leave=False)
         for i, (images, labels) in enumerate(pbar):
+            # * autocast: mix precision; inference_mode: no grad
             with torch.autocast("cuda") and (torch.inference_mode() if not train else torch.enable_grad()):
+                # [batch, 3, img_size, img_size]
                 images = images.to(self.device)
+                # [batch]
                 labels = labels.to(self.device)
+                # [batch]
                 t = self.sample_timesteps(images.shape[0]).to(self.device)
                 x_t, noise = self.noise_images(images, t)
+                # * for 90% of the time we train conditional, 
+                # * and 10% we replace label to None to train classifier free
                 if np.random.random() < 0.1:
                     labels = None
+                # [5,3,64,64]
                 predicted_noise = self.model(x_t, t, labels)
                 loss = self.mse(noise, predicted_noise)
                 avg_loss += loss
@@ -134,55 +157,57 @@ class Diffusion:
         "Log images to wandb and save them to disk"
         labels = torch.arange(self.num_classes).long().to(self.device)
         sampled_images = self.sample(use_ema=False, labels=labels)
-        wandb.log({"sampled_images":     [wandb.Image(img.permute(1,2,0).squeeze().cpu().numpy()) for img in sampled_images]})
+        wandb.log({"sampled_images": [wandb.Image(img.permute(1,2,0).squeeze().cpu().numpy()) for img in sampled_images]})
 
-        # EMA model sampling
+        # * EMA model sampling
         ema_sampled_images = self.sample(use_ema=True, labels=labels)
         plot_images(sampled_images)  #to display on jupyter if available
         wandb.log({"ema_sampled_images": [wandb.Image(img.permute(1,2,0).squeeze().cpu().numpy()) for img in ema_sampled_images]})
 
-    def load(self, model_cpkt_path, model_ckpt="ckpt.pt", ema_model_ckpt="ema_ckpt.pt"):
+    def load(self, model_cpkt_path, model_ckpt="conditional_ckpt.pt", ema_model_ckpt="conditional_ema_ckpt.pt"):
         self.model.load_state_dict(torch.load(os.path.join(model_cpkt_path, model_ckpt)))
         self.ema_model.load_state_dict(torch.load(os.path.join(model_cpkt_path, ema_model_ckpt)))
 
     def save_model(self, run_name, epoch=-1):
         "Save model locally and on wandb"
-        torch.save(self.model.state_dict(), os.path.join("models", run_name, f"ckpt.pt"))
-        torch.save(self.ema_model.state_dict(), os.path.join("models", run_name, f"ema_ckpt.pt"))
-        torch.save(self.optimizer.state_dict(), os.path.join("models", run_name, f"optim.pt"))
+        torch.save(self.model.state_dict(), os.path.join("models", run_name, f"conditional_ckpt.pt"))
+        torch.save(self.ema_model.state_dict(), os.path.join("models", run_name, f"conditional_ema_ckpt.pt"))
+        torch.save(self.optimizer.state_dict(), os.path.join("models", run_name, f"conditional_optim.pt"))
         at = wandb.Artifact("model", type="model", description="Model weights for DDPM conditional", metadata={"epoch": epoch})
         at.add_dir(os.path.join("models", run_name))
         wandb.log_artifact(at)
 
     def prepare(self, args):
         mk_folders(args.run_name)
+        # * cifar64: 50000 train and 10000 val data
         self.train_dataloader, self.val_dataloader = get_data(args)
+        if os.path.exists(os.path.join(args.model_ckpt_path,"conditional_optimizer.pt")):
+            self.optimizer = torch.load(os.path.join(args.model_ckpt_path,"conditional_optimizer.pt"))
         self.optimizer = optim.AdamW(self.model.parameters(), lr=args.lr, eps=1e-5)
         self.scheduler = optim.lr_scheduler.OneCycleLR(self.optimizer, max_lr=args.lr, 
                                                  steps_per_epoch=len(self.train_dataloader), epochs=args.epochs)
         self.mse = nn.MSELoss()
-        self.ema = EMA(0.995)
+        self.ema = EMA(beta=0.995)
         self.scaler = torch.cuda.amp.GradScaler()
 
     def fit(self, args):
+        if os.path.exists(os.path.join(args.model_ckpt_path, "conditional_ckpt.pt")) and os.path.exists(os.path.join(args.model_ckpt_path, "conditional_ckpt.pt")):
+            self.load(args.model_ckpt_path, model_ckpt='conditional_ckpt.pt', ema_model_ckpt='conditional_ema_ckpt.pt')
         for epoch in progress_bar(range(args.epochs), total=args.epochs, leave=True):
             logging.info(f"Starting epoch {epoch}:")
             _  = self.one_epoch(train=True)
             
-            ## validation
+            # * validation
             if args.do_validation:
                 avg_loss = self.one_epoch(train=False)
                 wandb.log({"val_mse": avg_loss})
             
-            # log predicitons
+            # * log predicitons
             if epoch % args.log_every_epoch == 0:
                 self.log_images()
 
         # save model
         self.save_model(run_name=args.run_name, epoch=epoch)
-
-
-
 
 def parse_args(config):
     parser = argparse.ArgumentParser(description='Process hyper-parameters')
@@ -207,7 +232,7 @@ def parse_args(config):
 if __name__ == '__main__':
     parse_args(config)
 
-    ## seed everything
+    # * seed everything
     set_seed(config.seed)
 
     diffuser = Diffusion(config.noise_steps, img_size=config.img_size, num_classes=config.num_classes)
