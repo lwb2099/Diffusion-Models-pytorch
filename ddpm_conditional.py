@@ -116,6 +116,15 @@ class Diffusion:
         return x
 
     def train_step(self, loss):
+        """
+        This function performs a single training step for a PyTorch model, including backpropagation,
+        optimization, exponential moving average, and scheduler updates.
+        
+        Args:
+          loss: The loss value calculated during the training process. It is a measure of how well the
+        model is performing on the given task. The goal of the training process is to minimize this loss
+        value.
+        """
         self.optimizer.zero_grad()
         self.scaler.scale(loss).backward()
         self.scaler.step(self.optimizer)
@@ -227,7 +236,6 @@ def parse_args(config):
     # update config with parsed args
     for k, v in args.items():
         setattr(config, k, v)
-
 
 if __name__ == '__main__':
     parse_args(config)
